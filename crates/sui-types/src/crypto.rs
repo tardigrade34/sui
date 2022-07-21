@@ -11,9 +11,8 @@ use base64ct::Encoding;
 use digest::Digest;
 use narwhal_crypto::ed25519::{
     Ed25519AggregateSignature, Ed25519KeyPair, Ed25519PrivateKey, Ed25519PublicKey,
-    Ed25519PublicKeyBytes, Ed25519Signature,
+    Ed25519Signature,
 };
-use narwhal_crypto::pubkey_bytes::PublicKeyBytes as NWPKBytes;
 pub use narwhal_crypto::traits::KeyPair as KeypairTraits;
 pub use narwhal_crypto::traits::{
     AggregateAuthenticator, Authenticator, SigningKey, ToFromBytes, VerifyingKey,
@@ -26,13 +25,14 @@ use serde::{Deserialize, Serialize};
 use serde_with::serde_as;
 use serde_with::Bytes;
 use sha3::Sha3_256;
+use std::fmt::Display;
 use std::hash::{Hash, Hasher};
+use std::str::FromStr;
 
 // Comment the one you want to use
 pub type KeyPair = Ed25519KeyPair; // Associated Types don't work here yet for some reason.
 pub type PrivateKey = Ed25519PrivateKey;
 pub type PublicKey = Ed25519PublicKey;
-pub type PublicKeyBytes = Ed25519PublicKeyBytes;
 
 // Signatures for Authorities
 pub type AuthoritySignature = Ed25519Signature;
@@ -42,20 +42,92 @@ pub type AggregateAuthoritySignature = Ed25519AggregateSignature;
 pub type AccountSignature = Ed25519Signature;
 pub type AggregateAccountSignature = Ed25519AggregateSignature;
 
-pub trait SuiAuthoritySignature<S: Authenticator> {
+#[serde_as]
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct PublicKeyBytes(
+    #[serde_as(as = "Bytes")]
+    [u8; PublicKey::LENGTH]
+);
+
+impl TryFrom<PublicKeyBytes> for PublicKey {
+    type Error = signature::Error;
+
+    fn try_from(bytes: PublicKeyBytes) -> Result<PublicKey, Self::Error> {
+        PublicKey::from_bytes(bytes.as_ref()).map_err(|_| Self::Error::new())
+    }
+}
+
+impl From<&PublicKey> for PublicKeyBytes {
+    fn from(pk: &PublicKey) -> PublicKeyBytes {
+        PublicKeyBytes::from_bytes(pk.as_ref().clone()).unwrap()
+    }
+}
+
+impl AsRef<[u8]> for PublicKeyBytes {
+    fn as_ref(&self) -> &[u8] {
+        &self.0[..]
+    }
+}
+
+impl Display for PublicKeyBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
+        let s = hex::encode(&self.0);
+        write!(f, "k#{}", s)?;
+        Ok(())
+    }
+}
+
+impl ToFromBytes for PublicKeyBytes {
+    fn from_bytes(bytes: &[u8]) -> Result<Self, signature::Error> {
+        let bytes: [u8; PublicKey::LENGTH] = bytes.try_into().map_err(signature::Error::from_source)?;
+        Ok(PublicKeyBytes(bytes))
+    }
+}
+
+impl PublicKeyBytes {
+    /// This ensures it's impossible to construct an instance with other than registered lengths
+    pub fn new(bytes: [u8; PublicKey::LENGTH]) -> PublicKeyBytes
+    where
+    {
+        PublicKeyBytes (bytes)
+    }
+}
+
+impl PublicKeyBytes {
+    // this is probably derivable, but we'd rather have it explicitly laid out for instructional purposes,
+    // see [#34](https://github.com/MystenLabs/narwhal/issues/34)
+    fn default() -> Self {
+        Self([0u8; PublicKey::LENGTH])
+    }
+}
+
+impl FromStr for PublicKeyBytes {
+    type Err = anyhow::Error;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let s = s.strip_prefix("0x").unwrap_or(s);
+        let value = hex::decode(s)?;
+        Self::from_bytes(&value[..]).map_err(|_| anyhow::anyhow!("byte deserialization failed"))
+    }
+}
+
+impl Copy for PublicKeyBytes {}
+
+pub trait SuiAuthoritySignature {
     fn new<T>(value: &T, secret: &dyn signature::Signer<Self>) -> Self
     where
         T: Signable<Vec<u8>>;
-    fn verify<T, const N: usize>(
+
+    fn verify<T>(
         &self,
         value: &T,
-        author: NWPKBytes<S::PubKey, N>,
+        author: PublicKeyBytes,
     ) -> Result<(), SuiError>
     where
         T: Signable<Vec<u8>>;
 }
 
-impl<S: Authenticator> SuiAuthoritySignature<S> for S {
+impl SuiAuthoritySignature for AuthoritySignature {
     fn new<T>(value: &T, secret: &dyn signature::Signer<Self>) -> Self
     where
         T: Signable<Vec<u8>>,
@@ -65,17 +137,17 @@ impl<S: Authenticator> SuiAuthoritySignature<S> for S {
         secret.sign(&message)
     }
 
-    fn verify<T, const N: usize>(
+    fn verify<T>(
         &self,
         value: &T,
-        author: NWPKBytes<S::PubKey, N>,
+        author: PublicKeyBytes,
     ) -> Result<(), SuiError>
     where
         T: Signable<Vec<u8>>,
     {
         // is this a cryptographically valid public Key?
         let public_key =
-            S::PubKey::from_bytes(author.as_ref()).map_err(|_| SuiError::InvalidAddress)?;
+            PublicKey::from_bytes(author.as_ref()).map_err(|_| SuiError::InvalidAddress)?;
         // serialize the message (see BCS serialization for determinism)
         let mut message = Vec::new();
         value.write(&mut message);
@@ -305,7 +377,7 @@ impl PartialEq for AuthoritySignInfo {
 }
 
 impl AuthoritySignInfo {
-    pub fn add_to_verification_obligation<T>(
+    pub fn add_to_verification_obligation(
         &self,
         committee: &Committee,
         obligation: &mut VerificationObligation<AggregateAuthoritySignature>,
@@ -332,7 +404,11 @@ impl AuthoritySignInfo {
         T: Signable<Vec<u8>>,
     {
         let mut obligation = VerificationObligation::default();
-        self.add_to_verification_obligation(data, committee, &mut obligation)?;
+        let mut message = Vec::new();
+        data.write(&mut message);
+        let idx = obligation.add_message(message);
+
+        self.add_to_verification_obligation(committee, &mut obligation, idx)?;
         obligation.verify_all()?;
         Ok(())
     }
